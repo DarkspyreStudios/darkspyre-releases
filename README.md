@@ -1,5 +1,15 @@
 # darkspyre-releases
 
+<!-- ownership-notice:start -->
+> **Proprietary software.** Copyright © 2026 Brandon Mathis. All rights reserved.
+> Published releases may be run under the terms in LICENSE.md. No other
+> permission is granted to use, copy, modify, or distribute this software
+> without prior written authorization.
+> Any contribution, including code, reviews, patches, issues and designs, is
+> assigned to Brandon Mathis on submission. See [LICENSE.md](LICENSE.md) and
+> [CONTRIBUTING.md](CONTRIBUTING.md).
+<!-- ownership-notice:end -->
+
 This public repository holds Darkspyre project release artifacts as GitHub release assets. The
 source tree holds only the documentation and the tooling that validates, prepares and verifies
 those releases. It holds no source code for the artifacts themselves, and no artifact is committed
