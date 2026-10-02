@@ -10,6 +10,7 @@ to git.
 | Component | Tag | Documentation |
 | --- | --- | --- |
 | GGML driver archives | `ggml-drivers-v<version>` | [docs/ggml-drivers.md](docs/ggml-drivers.md) |
+| TensorSharp direct CUDA builds | `tensorsharp-cuda-builds-v<artifact-version>` | [docs/tensorsharp-cuda-builds.md](docs/tensorsharp-cuda-builds.md) |
 
 Each component uses its own tag prefix, so the releases of different components never share a tag.
 A published release is immutable. A corrected build is published under a new version.
