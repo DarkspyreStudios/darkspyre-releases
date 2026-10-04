@@ -44,7 +44,7 @@ components, and GitHub's "latest" marker must not point at a driver release.
 
 One JSON file from the TensorSharp release is the single input for archive names, sizes, hashes and
 contents. It has the `tensorsharp-native-artifacts` shape that TensorSharp's
-`eng/native-artifact-manifest.py` produces. The tool reads the fields below and ignores every other
+`eng/pack-ggml-natives.py` produces. The tool reads the fields below and ignores every other
 field, such as `packages`, `binaryIdentity`, `build` and `requires`.
 
 An artifact is hosted when it has `delivery` `variant-archive` or a non-null `archive`. Every other
@@ -60,17 +60,23 @@ artifact ships in a baseline package and is skipped. At least one artifact must 
 | `artifacts[].tensorSharp.packageCommit` | The full lowercase TensorSharp commit id of the release. Equal on every hosted artifact. |
 | `artifacts[].tensorSharp.nativeSourceCommit` | The full lowercase commit id the natives were built from. Equal on every hosted artifact. |
 | `artifacts[].ggml.version`, `.commit` | The ggml version and full lowercase commit id. Equal on every hosted artifact. |
+| `artifacts[].nativeAbi` | The artifact's actual native ABI identity: exactly 64 lowercase hex digits. Required, preserved unchanged, and independent of other artifacts' ABI values. |
 | `artifacts[].backends` | A non-empty list of distinct lowercase backend names, such as `["cpu", "cuda"]`. |
 | `artifacts[].entryLibrary` | The path of the library the engine loads. It must be a regular file listed in `files`. |
 | `artifacts[].files` | Every native file in the archive: `{path, size, sha256}` for a regular file, or `{path, link}` for a tar symbolic link. |
 | `artifacts[].notices` | Every license and notice file in the archive: a path, or `{path, size, sha256}`. At least one is required. |
-| `artifacts[].totalSize` | Optional. When present, the sum of the `files` sizes. |
+| `artifacts[].totalSize` | Optional. When present, the sum of the original `files` sizes, before license normalization. |
 | `artifacts[].archive` | `{name, format, size, sha256}`. `format` is `tar.gz` or `zip`. `name` follows the release layout. |
 
 Paths are relative POSIX paths. A path must not be absolute or hold a backslash, a control
 character, an empty, `.` or `..` segment, a character Windows cannot store (`<>:"|?*`), a segment
 ending in a dot or space, or a reserved Windows device name such as `con` or `nul`. Paths are unique
-case-insensitively, and no path is both a file and a notice.
+case-insensitively within each inventory. At input only, a regular file may also appear in notices
+when both entries carry the exact same literal path, size and SHA-256. The tool keeps that record
+in notices and removes its matching payload record. Bare notice paths, links, case-only differences
+and conflicting metadata cannot overlap. This normalization changes inventory roles, not archive
+paths or bytes. The disjoint union preserves each physical path once. The original `totalSize`
+check precedes normalization; `entryLibrary` must remain a regular payload file afterward.
 
 The archives sit in one directory, under their `archive.name` values.
 
@@ -78,6 +84,7 @@ The archives sit in one directory, under their `archive.name` values.
 
 The tool opens every hosted archive and refuses it when:
 
+- its normalized `files` and `notices` overlap, even with identical metadata;
 - its length or SHA-256 differs from `archive.size` or `archive.sha256`;
 - a listed file or notice is missing;
 - a regular file's length or SHA-256 differs from its `files` entry, or from its `notices` entry
@@ -141,6 +148,7 @@ so equal input gives equal bytes.
       "variant": "cuda13",
       "backends": ["cpu", "cuda"],
       "entryLibrary": "libGgmlOps.so",
+      "nativeAbi": "<64 lowercase hex digits from this artifact>",
       "asset": {
         "name": "ggml-2.9.0-linux-x64-cuda13.tar.gz",
         "format": "tar.gz",
@@ -162,6 +170,13 @@ so equal input gives equal bytes.
 Every notice carries the size and SHA-256 measured from the validated archive, whether or not the
 artifact manifest listed them. `files` entries carry the manifest's values, which the archive check
 confirmed. A symbolic link appears as `{path, link}`.
+
+Catalog readback requires each artifact's `nativeAbi` and disjoint file/notice inventories. It
+rejects missing or malformed ABI values and every overlap; it never normalizes a loaded catalog
+or supplies an ABI default. `entryLibrary` names a regular payload file. `ggml.commit` remains
+release-wide. The original manifest bytes supply `source.sha256`; normalization does not rewrite
+them or add a `totalSize` field to the catalog. ABI syntax validation does not prove native
+compatibility with a managed package.
 
 ### release.json
 

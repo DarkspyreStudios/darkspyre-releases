@@ -169,6 +169,24 @@ def check_file_list(label: str, value, problems: list[str], notices: bool) -> li
     return clean
 
 
+def normalize_input_inventory(label: str, files: list[dict], notices: list[dict],
+                              problems: list[str]) -> tuple[list[dict], list[dict]]:
+    """Project exact matching source overlap into disjoint payload and notice lists."""
+    by_path = {notice["path"].casefold(): notice for notice in notices}
+    payload = []
+    for item in files:
+        notice = by_path.get(item["path"].casefold())
+        if notice is None:
+            payload.append(item)
+        elif ("link" not in item and "size" in item and "sha256" in item
+              and "size" in notice and "sha256" in notice and item == notice):
+            continue
+        else:
+            problems.append(f"{label} path {item['path']} overlaps files and notices without identical regular-file metadata")
+            payload.append(item)
+    return payload, list(notices)
+
+
 def is_hosted(artifact: dict) -> bool:
     return artifact.get("archive") is not None or artifact.get("delivery") == HOSTED_DELIVERY
 
@@ -233,6 +251,10 @@ def parse_input(data) -> dict:
             ggml = {}
         identity["ggml"].add((ggml.get("version"), ggml.get("commit")))
 
+        native_abi = artifact.get("nativeAbi")
+        if not isinstance(native_abi, str) or not SHA256.fullmatch(native_abi):
+            problems.append(f"{label} nativeAbi {native_abi!r} must be 64 lowercase hex digits")
+
         backends = artifact.get("backends")
         if (not isinstance(backends, list) or not backends
                 or not all(isinstance(b, str) and BACKEND.match(b) for b in backends)
@@ -242,15 +264,13 @@ def parse_input(data) -> dict:
 
         files = check_file_list(f"{label} files", artifact.get("files"), problems, notices=False)
         notices = check_file_list(f"{label} notices", artifact.get("notices"), problems, notices=True)
-        overlap = {f["path"].casefold() for f in files} & {n["path"].casefold() for n in notices}
-        if overlap:
-            problems.append(f"{label} lists {', '.join(sorted(overlap))} in both files and notices")
-        entry = artifact.get("entryLibrary")
-        if not any(f["path"] == entry and "link" not in f for f in files):
-            problems.append(f"{label} entryLibrary {entry!r} must be a regular file listed in files")
         total = artifact.get("totalSize")
         if total is not None and total != sum(f.get("size", 0) for f in files):
             problems.append(f"{label} totalSize {total!r} is not the sum of its file sizes")
+        files, notices = normalize_input_inventory(label, files, notices, problems)
+        entry = artifact.get("entryLibrary")
+        if not any(f["path"] == entry and "link" not in f for f in files):
+            problems.append(f"{label} entryLibrary {entry!r} must be a regular file listed in files")
 
         archive = artifact.get("archive")
         if not isinstance(archive, dict):
@@ -267,6 +287,7 @@ def parse_input(data) -> dict:
             problems.append(f"{label} archive.sha256 {digest!r} must be 64 lowercase hex digits")
         hosted.append({
             "rid": rid, "variant": variant, "backends": backends, "entryLibrary": entry,
+            "nativeAbi": native_abi,
             "archive": {"name": name, "format": fmt, "size": size, "sha256": digest},
             "files": files, "notices": notices,
         })
@@ -362,6 +383,9 @@ def check_archive_bytes(path: Path, archive: dict) -> list[str]:
 def check_archive(path: Path, artifact: dict) -> tuple[list[str], list[dict]]:
     """Check one archive's bytes and exact contents. Return the problems and the measured notices."""
     archive = artifact["archive"]
+    overlap = {f["path"].casefold() for f in artifact["files"]} & {n["path"].casefold() for n in artifact["notices"]}
+    if overlap:
+        return [f"{archive['name']}: lists {', '.join(sorted(overlap))} in both files and notices"], []
     problems = check_archive_bytes(path, archive)
     if problems:
         return problems, []
@@ -459,6 +483,7 @@ def build_catalog(release: dict, source_sha256: str, notices: dict[tuple, list[d
             "variant": a["variant"],
             "backends": list(a["backends"]),
             "entryLibrary": a["entryLibrary"],
+            "nativeAbi": a["nativeAbi"],
             "asset": {
                 "name": archive["name"],
                 "format": archive["format"],
@@ -536,7 +561,22 @@ def validate_catalog(catalog) -> list[str]:
         return problems + ["artifacts must be a non-empty list"]
     keys = []
     for index, a in enumerate(artifacts):
+        label = f"artifacts[{index}]"
+        if not isinstance(a, dict):
+            problems.append(f"{label} must be an object")
+            continue
         try:
+            native_abi = a.get("nativeAbi")
+            if not isinstance(native_abi, str) or not SHA256.fullmatch(native_abi):
+                problems.append(f"{label} nativeAbi {native_abi!r} must be 64 lowercase hex digits")
+            files = check_file_list(f"{label} files", a.get("files"), problems, notices=False)
+            notices = check_file_list(f"{label} notices", a.get("notices"), problems, notices=True)
+            overlap = {f["path"].casefold() for f in files} & {n["path"].casefold() for n in notices}
+            if overlap:
+                problems.append(f"{label} lists {', '.join(sorted(overlap))} in both files and notices")
+            entry = a.get("entryLibrary")
+            if not any(f["path"] == entry and "link" not in f for f in files):
+                problems.append(f"{label} entryLibrary {entry!r} must be a regular file listed in files")
             asset = a["asset"]
             expected = archive_name(version, a["rid"], a["variant"], asset["format"])
             if a["rid"] not in RIDS or not VARIANT.match(a["variant"]) or asset["format"] not in FORMATS:

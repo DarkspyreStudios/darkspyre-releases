@@ -98,6 +98,11 @@ In the commands below, `<tag>` is `ggml-drivers-v<version>` and `<dir>` is
 12. Hand `<dir>/ggml-drivers-<version>.catalog.json` and its SHA-256 from step 3 to the AgentDS
     integration owner. The `core.inference` module catalog must be generated from this file. Its
     RID, variant, asset, size, SHA-256, file and notice entries must equal the catalog input's.
+    Preserve each artifact's actual `nativeAbi` and `entryLibrary`, and the release-wide
+    `ggml.commit`. Files and notices are disjoint after exact matching source-license
+    normalization; their union retains the original archive paths and metadata. No archive
+    bytes, sizes or hashes change during this handoff. `release.json` remains a locator, not
+    a substitute for these trusted identity fields.
 13. Keep a copy of the catalog input and `release.json` outside `tmp/`, then delete `<dir>`.
 
 ## Withdrawal
