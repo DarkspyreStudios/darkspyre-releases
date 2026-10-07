@@ -45,4 +45,6 @@ SHA-256 catalog ships inside the `core.inference` module package.
 python3 -m unittest discover -s tests -v
 ```
 
-The tests make no network calls.
+The tests use local fixture archives, a stub GitHub CLI and a loopback HTTP server. They make no
+public network calls. Fixture files live under `/Volumes/Data/tmp/dsa-675-release-catalog/` and
+are removed after each test.

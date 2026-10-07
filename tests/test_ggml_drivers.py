@@ -4,7 +4,8 @@ Run from the repository root:
 
     python3 -m unittest discover -s tests -v
 
-Fixtures are written under tmp/tests/ and removed afterwards. No test reaches the public network.
+Fixtures are written under /Volumes/Data/tmp/dsa-675-release-catalog/ and removed afterwards.
+No test reaches the public network.
 """
 import contextlib
 import copy
@@ -26,7 +27,7 @@ sys.path.insert(0, str(ROOT / "tests"))
 import ggml_drivers as drivers  # noqa: E402
 from github_server import GitHubReleaseServer  # noqa: E402
 
-WORK = ROOT / "tmp" / "tests"
+WORK = Path("/Volumes/Data/tmp/dsa-675-release-catalog")
 STUB_GH = [sys.executable, str(ROOT / "tests" / "stub_gh.py")]
 VERSION = "2.9.0"
 TAG = f"ggml-drivers-v{VERSION}"
@@ -131,6 +132,7 @@ class Fixture:
             "tensorSharp": {"packageVersion": self.version, "packageCommit": PACKAGE_COMMIT,
                             "nativeSourceCommit": NATIVE_COMMIT},
             "ggml": dict(GGML), "entryLibrary": entry_path or entry,
+            "nativeAbi": sha(f"{rid}-{variant}".encode()),
             "binaryIdentity": {"tsggmlExports": 312}, "build": {"host": "fixture"},
             "files": payload, "totalSize": sum(f.get("size", 0) for f in payload),
             "requires": {"os-package": ["libgomp.so.1"]},
@@ -221,8 +223,43 @@ class GenerateTests(ToolTestCase):
         self.assertEqual(catalog["tensorSharp"], {"version": VERSION, "commit": PACKAGE_COMMIT,
                                                   "nativeSourceCommit": NATIVE_COMMIT})
         self.assertEqual(catalog["ggml"], GGML)
+        self.assertEqual([a["nativeAbi"] for a in catalog["artifacts"]],
+                         [sha(f"{a['rid']}-{a['variant']}".encode()) for a in catalog["artifacts"]])
         self.assertEqual(catalog["source"]["sha256"], sha(self.fixture.path.read_bytes()))
         self.assertIn({"path": "lib/libGgmlOps.so", "link": "libGgmlOps.so.1"}, catalog["artifacts"][0]["files"])
+
+    def test_matching_notice_overlap_preserves_archive_and_catalog_closure(self) -> None:
+        artifact = self.fixture.artifact("linux-x64", "cuda13")
+        notices = [file_entry("THIRD-PARTY-NOTICES.txt", NOTICE), file_entry("licenses/cuda.txt", b"CUDA EULA\n")]
+        artifact["notices"] = copy.deepcopy(notices)
+        artifact["files"].extend(copy.deepcopy(notices))
+        artifact["totalSize"] += sum(n["size"] for n in notices)
+        original = (self.fixture.dir / artifact["archive"]["name"]).read_bytes()
+        self.fixture.write()
+
+        catalog = self.generate()
+        cuda = next(a for a in catalog["artifacts"] if a["variant"] == "cuda13")
+        self.assertEqual(cuda["notices"], notices)
+        self.assertEqual({f["path"] for f in cuda["files"]}, {"libGgmlOps.so", "libcudart.so.13"})
+        self.assertEqual(cuda["entryLibrary"], artifact["entryLibrary"])
+        self.assertEqual(cuda["nativeAbi"], artifact["nativeAbi"])
+        self.assertEqual(catalog["ggml"], GGML)
+        self.assertEqual((self.out / "assets" / artifact["archive"]["name"]).read_bytes(), original)
+        self.assertEqual(drivers.validate_catalog(catalog), [])
+        self.assertEqual(drivers.verify_release_dir(self.out), [])
+
+    def test_catalog_readback_refuses_invalid_abi(self) -> None:
+        catalog = self.generate()
+        for invalid in (None, "A" * 64, "0" * 63):
+            with self.subTest(native_abi=invalid):
+                changed = copy.deepcopy(catalog)
+                changed["artifacts"][0]["nativeAbi"] = invalid
+                self.assertTrue(any("nativeAbi" in p for p in drivers.validate_catalog(changed)))
+
+    def test_catalog_readback_refuses_matching_notice_overlap(self) -> None:
+        catalog = self.generate()
+        catalog["artifacts"][1]["files"].append(copy.deepcopy(catalog["artifacts"][1]["notices"][0]))
+        self.assertTrue(any("both files and notices" in p for p in drivers.validate_catalog(catalog)))
 
     def test_output_is_deterministic(self) -> None:
         self.generate()
@@ -313,7 +350,39 @@ class InputTests(ToolTestCase):
         self.mutate(lambda d: d["artifacts"][0].update(entryLibrary="lib/libGgmlOps.so"), "entryLibrary")
 
     def test_file_in_files_and_notices(self) -> None:
-        self.mutate(lambda d: d["artifacts"][2]["notices"].append("GgmlOps.dll"), "both files and notices")
+        self.mutate(lambda d: d["artifacts"][2]["notices"].append("GgmlOps.dll"), "overlaps files and notices")
+
+    def test_native_abi_is_required_per_artifact(self) -> None:
+        for invalid in (None, "A" * 64, "0" * 63):
+            with self.subTest(native_abi=invalid):
+                changed = copy.deepcopy(self.fixture.data)
+                changed["artifacts"][0]["nativeAbi"] = invalid
+                self.refused(lambda: drivers.parse_input(changed), "nativeAbi")
+
+    def test_conflicting_notice_overlap_is_refused(self) -> None:
+        notice = file_entry("THIRD-PARTY-NOTICES.txt", NOTICE)
+        for changed_notice in ({**notice, "size": notice["size"] + 1},
+                               {**notice, "sha256": "0" * 64},
+                               {**notice, "path": notice["path"].lower()}):
+            with self.subTest(notice=changed_notice):
+                changed = copy.deepcopy(self.fixture.data)
+                artifact = changed["artifacts"][1]
+                artifact["files"].append(notice)
+                artifact["totalSize"] += notice["size"]
+                artifact["notices"][0] = changed_notice
+                self.refused(lambda: drivers.parse_input(changed), "overlaps files and notices")
+
+    def test_original_total_size_validates_before_overlap_normalization(self) -> None:
+        artifact = self.fixture.artifact("linux-x64", "cuda13")
+        artifact["files"].append(copy.deepcopy(artifact["notices"][0]))
+        self.fixture.write()
+        self.refused(self.validate, "totalSize")
+
+    def test_entry_library_cannot_be_normalized_into_notices(self) -> None:
+        artifact = self.fixture.artifact("linux-x64", "cuda13")
+        artifact["notices"].append(copy.deepcopy(artifact["files"][0]))
+        self.fixture.write()
+        self.refused(self.validate, "entryLibrary")
 
     def test_notices_required(self) -> None:
         self.mutate(lambda d: d["artifacts"][2].update(notices=[]), "notices must be a non-empty list")
