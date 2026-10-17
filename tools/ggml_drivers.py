@@ -242,15 +242,19 @@ def parse_input(data) -> dict:
 
         files = check_file_list(f"{label} files", artifact.get("files"), problems, notices=False)
         notices = check_file_list(f"{label} notices", artifact.get("notices"), problems, notices=True)
+        total = artifact.get("totalSize")
+        if total is not None and total != sum(f.get("size", 0) for f in files):
+            problems.append(f"{label} totalSize {total!r} is not the sum of its file sizes")
+        # TensorSharp's pack-ggml-natives.py lists each licence file in files and again in notices. A notice that names
+        # the same size and SHA-256 as its file entry is one notice; any other overlap is refused.
+        same = {(n["path"].casefold(), n.get("size"), n.get("sha256")) for n in notices if "size" in n}
+        files = [f for f in files if (f["path"].casefold(), f.get("size"), f.get("sha256")) not in same]
         overlap = {f["path"].casefold() for f in files} & {n["path"].casefold() for n in notices}
         if overlap:
             problems.append(f"{label} lists {', '.join(sorted(overlap))} in both files and notices")
         entry = artifact.get("entryLibrary")
         if not any(f["path"] == entry and "link" not in f for f in files):
             problems.append(f"{label} entryLibrary {entry!r} must be a regular file listed in files")
-        total = artifact.get("totalSize")
-        if total is not None and total != sum(f.get("size", 0) for f in files):
-            problems.append(f"{label} totalSize {total!r} is not the sum of its file sizes")
 
         archive = artifact.get("archive")
         if not isinstance(archive, dict):

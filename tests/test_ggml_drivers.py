@@ -212,6 +212,17 @@ class GenerateTests(ToolTestCase):
         self.assertNotIn("sha256", json.dumps(release["assets"]))
         self.assertEqual(release["source"]["sha256"], catalog["source"]["sha256"])
 
+    def test_licence_listed_as_file_and_notice_is_one_notice(self) -> None:
+        cuda = next(a for a in self.fixture.data["artifacts"] if "licenses/cuda.txt" in a["notices"])
+        licence = file_entry("licenses/cuda.txt", b"CUDA EULA\n")
+        cuda["notices"] = [licence if n == "licenses/cuda.txt" else n for n in cuda["notices"]]
+        cuda["files"].append(dict(licence))
+        cuda["totalSize"] = sum(f.get("size", 0) for f in cuda["files"])
+        self.fixture.write()
+        catalog = self.generate()
+        listed = next(a for a in catalog["artifacts"] if any(n["path"] == "licenses/cuda.txt" for n in a["notices"]))
+        self.assertNotIn("licenses/cuda.txt", [f["path"] for f in listed["files"]])
+
     def test_catalog_carries_measured_notices_and_identity(self) -> None:
         catalog = self.generate()
         cuda = catalog["artifacts"][1]

@@ -70,7 +70,8 @@ artifact ships in a baseline package and is skipped. At least one artifact must 
 Paths are relative POSIX paths. A path must not be absolute or hold a backslash, a control
 character, an empty, `.` or `..` segment, a character Windows cannot store (`<>:"|?*`), a segment
 ending in a dot or space, or a reserved Windows device name such as `con` or `nul`. Paths are unique
-case-insensitively, and no path is both a file and a notice.
+case-insensitively. A notice that names the same path, size and SHA-256 as a `files` entry is that
+file, listed once as a notice; TensorSharp lists every licence file both ways. Any other path in both lists is refused.
 
 The archives sit in one directory, under their `archive.name` values.
 
