@@ -32,7 +32,6 @@ VERSION = "2.9.0"
 TAG = f"ggml-drivers-v{VERSION}"
 PACKAGE_COMMIT = "9e36cdd3e2b05612191451180e64394831d63d20"
 NATIVE_COMMIT = "513de7b98fd7d0e52b19e1c42a6ebbe5bb5c98ff"
-GGML = {"version": "0.25.3", "commit": "353b63b439f27ab2cc19dac97ab1681ba6d2d084"}
 NOTICE = b"GGML is MIT licensed.\n"
 
 
@@ -130,7 +129,7 @@ class Fixture:
             "rid": rid, "variant": variant, "backends": backends, "delivery": "variant-archive",
             "tensorSharp": {"packageVersion": self.version, "packageCommit": PACKAGE_COMMIT,
                             "nativeSourceCommit": NATIVE_COMMIT},
-            "ggml": dict(GGML), "entryLibrary": entry_path or entry,
+            "entryLibrary": entry_path or entry,
             "binaryIdentity": {"tsggmlExports": 312}, "build": {"host": "fixture"},
             "files": payload, "totalSize": sum(f.get("size", 0) for f in payload),
             "requires": {"os-package": ["libgomp.so.1"]},
@@ -231,7 +230,7 @@ class GenerateTests(ToolTestCase):
         self.assertEqual(cuda["backends"], ["cpu", "cuda"])
         self.assertEqual(catalog["tensorSharp"], {"version": VERSION, "commit": PACKAGE_COMMIT,
                                                   "nativeSourceCommit": NATIVE_COMMIT})
-        self.assertEqual(catalog["ggml"], GGML)
+        self.assertNotIn("ggml", catalog)
         self.assertEqual(catalog["source"]["sha256"], sha(self.fixture.path.read_bytes()))
         self.assertIn({"path": "lib/libGgmlOps.so", "link": "libGgmlOps.so.1"}, catalog["artifacts"][0]["files"])
 
@@ -293,9 +292,6 @@ class InputTests(ToolTestCase):
     def test_inconsistent_build_identity(self) -> None:
         self.mutate(lambda d: d["artifacts"][1]["tensorSharp"].update(packageVersion="2.9.1"), "disagree")
 
-    def test_inconsistent_ggml(self) -> None:
-        self.mutate(lambda d: d["artifacts"][1]["ggml"].update(version="0.25.4"), "disagree on ggml")
-
     def test_short_commit(self) -> None:
         self.mutate(lambda d: d["artifacts"][0]["tensorSharp"].update(packageCommit="9e36cdd3"), "packageCommit")
 
@@ -341,6 +337,16 @@ class InputTests(ToolTestCase):
 
     def test_payload_file_needs_size_and_hash(self) -> None:
         self.mutate(lambda d: d["artifacts"][2]["files"].append({"path": "x.dll"}), "size")
+
+    def test_preload_must_be_a_listed_top_level_file_other_than_the_entry(self) -> None:
+        for preload in (["libGgmlOps.so"], ["missing.so"], ["libcudart.so.13", "libcudart.so.13"]):
+            with self.subTest(preload=preload):
+                self.mutate(lambda d: d["artifacts"][1].update(preload=preload), "preload")
+
+    def test_note_is_one_short_line(self) -> None:
+        for note in ("x" * 201, "two\nlines"):
+            with self.subTest(note=note):
+                self.mutate(lambda d: d["artifacts"][1].update(note=note), "note")
 
 
 class ArchiveTests(ToolTestCase):
@@ -441,6 +447,107 @@ class ArchiveTests(ToolTestCase):
     def test_corrupt_archive(self) -> None:
         self.fixture.rewrite("linux-x64", "cuda13", lambda p: p.write_bytes(b"not a gzip stream"))
         self.refused(self.validate, "cannot be read as tar.gz")
+
+
+UPSTREAM_VERSION = "2026.10.11"
+UPSTREAM_COMMIT = "f20fade4aa1feb67b5e2d43dad584c2af6865b1e"
+TS_GGML = ["TensorSharp-LICENSE.txt", "ggml-LICENSE.txt"]
+TS_GGML_NVIDIA = [*TS_GGML, "NVIDIA-cudart.txt", "NVIDIA-cuBLAS.txt"]
+# The variant table of TechDesign DSA-1112 5.9: (rid, variant) -> (upstream archive suffix, files in archive order,
+# preload, notices).
+UPSTREAM_ROWS = {
+    ("osx-arm64", "metal"): ("osx-arm64.tar.gz", ["libGgmlOps.dylib"], [], TS_GGML),
+    ("osx-arm64", "mlx"): ("osx-arm64.tar.gz", ["libmlxc.dylib", "libmlx.dylib", "mlx.metallib"], [],
+                          ["TensorSharp-LICENSE.txt", "mlx-LICENSE.txt", "mlx-c-LICENSE.txt"]),
+    ("linux-x64", "cpu"): ("linux-x64-cpu.tar.gz", ["libGgmlOps.so"], [], TS_GGML),
+    ("linux-x64", "cuda12"): ("linux-x64-cuda.tar.gz",
+                             ["libGgmlOps.so", "libcudart.so.12", "libcublasLt.so.12", "libcublas.so.12"],
+                             ["libcudart.so.12", "libcublasLt.so.12", "libcublas.so.12"], TS_GGML_NVIDIA),
+    ("linux-arm64", "cuda13-gb10"): ("linux-arm64-cuda13-GB10.tar.gz",
+                                    ["libGgmlOps.so", "libcudart.so.13", "libcublasLt.so.13", "libcublas.so.13"],
+                                    ["libcudart.so.13", "libcublasLt.so.13", "libcublas.so.13"], TS_GGML_NVIDIA),
+    ("win-x64", "cpu"): ("win-x64-cpu.zip", ["GgmlOps.dll"], [], TS_GGML),
+    ("win-x64", "cuda12"): ("win-x64-cuda.zip", ["GgmlOps.dll", "cudart64_12.dll", "cublasLt64_12.dll", "cublas64_12.dll"],
+                           ["cudart64_12.dll", "cublasLt64_12.dll", "cublas64_12.dll"], TS_GGML_NVIDIA),
+}
+
+
+def read_archive(path: Path) -> dict[str, bytes]:
+    if path.name.endswith(".zip"):
+        with zipfile.ZipFile(path) as archive:
+            return {info.filename: archive.read(info) for info in archive.infolist()}
+    with tarfile.open(path, "r:gz") as archive:
+        return {m.name: archive.extractfile(m).read() for m in archive.getmembers()}
+
+
+class ExtractUpstreamTests(ToolTestCase):
+    """T21: extract-upstream over synthetic upstream CLI archives that hold the driver files among other files."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.archives = self.work / "upstream"
+        self.archives.mkdir()
+        self.payload: dict[str, dict[str, bytes]] = {}
+        for upstream, files, _, _ in UPSTREAM_ROWS.values():
+            held = self.payload.setdefault(upstream, {"TensorSharp.Backends.MLX.dll": blob("managed", 1000),
+                                                      "libjaccl.dylib": blob("jaccl", 1000)})
+            held.update({name: blob(f"{upstream}:{name}", 3000) for name in files})
+        for upstream, files in self.payload.items():
+            self.write_upstream(upstream, files)
+
+    def write_upstream(self, suffix: str, files: dict[str, bytes]) -> None:
+        path = self.archives / f"tensorsharp-cli-{UPSTREAM_VERSION}-{suffix}"
+        path.unlink(missing_ok=True)
+        if suffix.endswith(".zip"):
+            write_zip(path, files)
+        else:
+            write_tar(path, {f"./{name}": data for name, data in files.items()})
+        if "GB10" in suffix:
+            sums = self.archives / f"tensorsharp-{UPSTREAM_VERSION}-linux-arm64-cuda13-GB10-SHA256SUMS"
+            sums.write_text(f"{sha(path.read_bytes())}  {path.name}\n"
+                            f"{'0' * 64}  tensorsharp-server-{UPSTREAM_VERSION}-linux-arm64-cuda13-GB10.tar.gz\n")
+
+    def extract(self) -> dict:
+        return drivers.extract_upstream(UPSTREAM_VERSION, self.archives, UPSTREAM_COMMIT, self.out)
+
+    def test_writes_one_archive_per_variant_row_with_exactly_its_files_and_notices(self) -> None:
+        manifest = self.extract()
+        names = {key: f"ggml-{UPSTREAM_VERSION}-{key[0]}-{key[1]}.{'zip' if row[0].endswith('.zip') else 'tar.gz'}"
+                 for key, row in UPSTREAM_ROWS.items()}
+        self.assertEqual(sorted(p.name for p in self.out.iterdir()),
+                         sorted([*names.values(), "tensorsharp-native-artifacts.json"]))
+        self.assertEqual([(a["rid"], a["variant"]) for a in manifest["artifacts"]], list(UPSTREAM_ROWS))
+        for artifact in manifest["artifacts"]:
+            key = (artifact["rid"], artifact["variant"])
+            upstream, files, preload, notices = UPSTREAM_ROWS[key]
+            with self.subTest(key=key):
+                expected = {name: self.payload[upstream][name] for name in files}
+                expected.update({f"licenses/{n}": (ROOT / "tools" / "notices" / n).read_bytes() for n in notices})
+                self.assertEqual(read_archive(self.out / names[key]), expected)
+                self.assertEqual((artifact["entryLibrary"], artifact["preload"]), (files[0], preload))
+
+        catalog = drivers.generate(self.out / "tensorsharp-native-artifacts.json", self.out, self.work / "release")
+        rows = {(a["rid"], a["variant"]): a for a in catalog["artifacts"]}
+        self.assertEqual(sorted(rows), sorted(UPSTREAM_ROWS))
+        self.assertEqual({key: a["preload"] for key, a in rows.items()},
+                         {key: row[2] for key, row in UPSTREAM_ROWS.items()})
+        self.assertEqual({key: a.get("note") for key, a in rows.items() if "note" in a},
+                         {("linux-arm64", "cuda13-gb10"): "Built for NVIDIA GB10 (Grace Blackwell) GPUs only."})
+        self.assertEqual(catalog["tensorSharp"], {"version": UPSTREAM_VERSION, "commit": UPSTREAM_COMMIT,
+                                                  "nativeSourceCommit": UPSTREAM_COMMIT})
+
+    def test_refuses_an_upstream_archive_missing_a_listed_file(self) -> None:
+        files = dict(self.payload["linux-x64-cuda.tar.gz"])
+        del files["libcublasLt.so.12"]
+        self.write_upstream("linux-x64-cuda.tar.gz", files)
+        self.refused(self.extract, "has no libcublasLt.so.12")
+        self.assertFalse(self.out.exists())
+
+    def test_refuses_a_gb10_archive_that_differs_from_its_sha256sums(self) -> None:
+        sums = self.archives / f"tensorsharp-{UPSTREAM_VERSION}-linux-arm64-cuda13-GB10-SHA256SUMS"
+        sums.write_text(f"{'1' * 64}  tensorsharp-cli-{UPSTREAM_VERSION}-linux-arm64-cuda13-GB10.tar.gz\n")
+        self.refused(self.extract, "SHA256SUMS says")
+        self.assertFalse(self.out.exists())
 
 
 def run_cli(*args: str) -> int:

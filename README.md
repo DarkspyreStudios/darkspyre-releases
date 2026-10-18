@@ -20,7 +20,6 @@ to git.
 | Component | Tag | Documentation |
 | --- | --- | --- |
 | GGML driver archives | `ggml-drivers-v<version>` | [docs/ggml-drivers.md](docs/ggml-drivers.md) |
-| GGML baseline driver packages | `ggml-packages-<abi16>` | [docs/ggml-packages.md](docs/ggml-packages.md) |
 | Apple Foundation Models helper | `apple-fm-helper-<rid>-<sha12>` | [docs/apple-fm-helper.md](docs/apple-fm-helper.md) |
 | Search processing payload | `search-processing-<rid>-<sha12>` | [docs/search-processing.md](docs/search-processing.md) |
 

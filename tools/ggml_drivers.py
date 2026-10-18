@@ -5,6 +5,7 @@ docs/ggml-drivers.md describes the input, the release layout, both generated doc
 validation rules. docs/ggml-drivers-publish-checklist.md describes a publication.
 
 Commands:
+  extract-upstream  write the driver archives and their artifact manifest from upstream TensorSharp's CLI archives
   validate          check a TensorSharp artifact manifest against its local archives
   generate          validate, then write a release directory with the assets to upload and the catalog input
   check-absent      refuse when the tag, a release for it or any archive name already exists on GitHub
@@ -17,6 +18,7 @@ read-only `gh api` GET requests.
 Every command exits 0 on success, 1 on a refused release and 2 on a usage error.
 """
 import argparse
+import gzip
 import hashlib
 import http.client
 import json
@@ -63,6 +65,8 @@ WINDOWS_FORBIDDEN = set('<>:"|?*')
 
 CHUNK = 1024 * 1024
 PAGE_SIZE = 100
+# The agent-ds driver catalog refuses a longer note.
+NOTE_LIMIT = 200
 
 
 class Refused(Exception):
@@ -189,7 +193,7 @@ def parse_input(data) -> dict:
     if not isinstance(artifacts, list):
         raise Refused(*problems, "artifacts must be a list")
 
-    identity: dict[str, set] = {"version": set(), "commit": set(), "nativeSourceCommit": set(), "ggml": set()}
+    identity: dict[str, set] = {"version": set(), "commit": set(), "nativeSourceCommit": set()}
     pairs: set[tuple] = set()
     hosted: list[dict] = []
     for index, artifact in enumerate(artifacts):
@@ -226,12 +230,6 @@ def parse_input(data) -> dict:
         identity["version"].add(version)
         identity["commit"].add(commit)
         identity["nativeSourceCommit"].add(native)
-        ggml = artifact.get("ggml")
-        if (not isinstance(ggml, dict) or not isinstance(ggml.get("version"), str) or not ggml["version"]
-                or not isinstance(ggml.get("commit"), str) or not COMMIT.match(ggml["commit"])):
-            problems.append(f"{label} ggml must hold a version and a full lowercase commit id")
-            ggml = {}
-        identity["ggml"].add((ggml.get("version"), ggml.get("commit")))
 
         backends = artifact.get("backends")
         if (not isinstance(backends, list) or not backends
@@ -253,8 +251,25 @@ def parse_input(data) -> dict:
         if overlap:
             problems.append(f"{label} lists {', '.join(sorted(overlap))} in both files and notices")
         entry = artifact.get("entryLibrary")
-        if not any(f["path"] == entry and "link" not in f for f in files):
+        regular = {f["path"] for f in files if "link" not in f}
+        if entry not in regular:
             problems.append(f"{label} entryLibrary {entry!r} must be a regular file listed in files")
+        preload = artifact.get("preload", [])
+        if not isinstance(preload, list):
+            problems.append(f"{label} preload {preload!r} must be a list of paths")
+            preload = []
+        preloaded: set = set()
+        for path in preload:
+            if (not isinstance(path, str) or "/" in path or path not in regular or path == entry
+                    or path in preloaded):
+                problems.append(f"{label} preload {path!r} must be a top-level regular file listed in files, "
+                                "other than entryLibrary, and listed once")
+            else:
+                preloaded.add(path)
+        note = artifact.get("note")
+        if note is not None and (not isinstance(note, str) or not note or len(note) > NOTE_LIMIT
+                                 or any(ord(c) < 32 for c in note)):
+            problems.append(f"{label} note {note!r} must be one line of at most {NOTE_LIMIT} characters")
 
         archive = artifact.get("archive")
         if not isinstance(archive, dict):
@@ -270,24 +285,21 @@ def parse_input(data) -> dict:
         if not isinstance(digest, str) or not SHA256.match(digest):
             problems.append(f"{label} archive.sha256 {digest!r} must be 64 lowercase hex digits")
         hosted.append({
-            "rid": rid, "variant": variant, "backends": backends, "entryLibrary": entry,
+            "rid": rid, "variant": variant, "backends": backends, "entryLibrary": entry, "preload": preload,
+            **({"note": note} if note is not None else {}),
             "archive": {"name": name, "format": fmt, "size": size, "sha256": digest},
             "files": files, "notices": notices,
         })
 
     for key, values in identity.items():
         if len(values) > 1:
-            problems.append(f"hosted artifacts disagree on {'ggml' if key == 'ggml' else 'tensorSharp.' + key}; "
-                            "one release holds one build")
+            problems.append(f"hosted artifacts disagree on tensorSharp.{key}; one release holds one build")
     if not hosted and not problems:
         problems.append(f"no artifact has delivery {HOSTED_DELIVERY!r} and an archive; there is nothing to host")
     if problems:
         raise Refused(*problems)
-    (version,), (commit,), (native,), ((ggml_version, ggml_commit),) = (identity[k] for k in identity)
-    return {
-        "schema": schema, "version": version, "commit": commit, "nativeSourceCommit": native,
-        "ggml": {"version": ggml_version, "commit": ggml_commit}, "artifacts": hosted,
-    }
+    (version,), (commit,), (native,) = (identity[k] for k in identity)
+    return {"schema": schema, "version": version, "commit": commit, "nativeSourceCommit": native, "artifacts": hosted}
 
 
 # Archive inspection.
@@ -463,6 +475,8 @@ def build_catalog(release: dict, source_sha256: str, notices: dict[tuple, list[d
             "variant": a["variant"],
             "backends": list(a["backends"]),
             "entryLibrary": a["entryLibrary"],
+            "preload": list(a["preload"]),
+            **({"note": a["note"]} if "note" in a else {}),
             "asset": {
                 "name": archive["name"],
                 "format": archive["format"],
@@ -482,7 +496,6 @@ def build_catalog(release: dict, source_sha256: str, notices: dict[tuple, list[d
         "repository": REPOSITORY,
         "tensorSharp": {"version": version, "commit": release["commit"],
                         "nativeSourceCommit": release["nativeSourceCommit"]},
-        "ggml": dict(release["ggml"]),
         "source": {"schema": release["schema"], "sha256": source_sha256},
         "artifacts": artifacts,
     }
@@ -508,8 +521,8 @@ def build_release(catalog: dict) -> dict:
 
 def build_notes(catalog: dict) -> str:
     lines = [
-        f"GGML driver archives for TensorSharp {catalog['version']}, built from TensorSharp commit "
-        f"{catalog['tensorSharp']['commit']} and ggml {catalog['ggml']['version']}.",
+        f"GGML driver archives for TensorSharp {catalog['version']}, extracted from TensorSharp's release archives "
+        f"at commit {catalog['tensorSharp']['commit']}.",
         "",
         "The trusted SHA-256 catalog for these archives ships inside the core.inference module package. "
         f"{RELEASE_ASSET} locates the archives and is not a trust source.",
@@ -853,6 +866,187 @@ def verify_published(out: Path, base_url: str, work: Path, keep: bool = False) -
     return transfers
 
 
+# Extraction from upstream TensorSharp's CLI release archives.
+
+NOTICES_DIR = Path(__file__).resolve().parent / "notices"
+NOTICE_DIR_IN_ARCHIVE = "licenses"
+OUTPUT_MANIFEST = "tensorsharp-native-artifacts.json"
+OUTPUT_SCHEMA = "tensorsharp-native-artifacts/1"
+GB10_NOTE = "Built for NVIDIA GB10 (Grace Blackwell) GPUs only."
+_TS, _GGML = "TensorSharp-LICENSE.txt", "ggml-LICENSE.txt"
+_NVIDIA = ("NVIDIA-cudart.txt", "NVIDIA-cuBLAS.txt")
+
+# One row per driver archive. upstream is the suffix of the tensorsharp-cli-<version>-<suffix> archive whose root
+# holds the row's files. The archive lists the entry library, then the preload libraries in load order, then the other
+# files, then each notice from tools/notices under licenses/.
+UPSTREAM_VARIANTS = (
+    {"rid": "osx-arm64", "variant": "metal", "upstream": "osx-arm64.tar.gz", "format": "tar.gz",
+     "backends": ["cpu", "metal"], "entryLibrary": "libGgmlOps.dylib", "preload": [], "other": [],
+     "notices": [_TS, _GGML]},
+    {"rid": "osx-arm64", "variant": "mlx", "upstream": "osx-arm64.tar.gz", "format": "tar.gz",
+     "backends": ["mlx"], "entryLibrary": "libmlxc.dylib", "preload": [], "other": ["libmlx.dylib", "mlx.metallib"],
+     "notices": [_TS, "mlx-LICENSE.txt", "mlx-c-LICENSE.txt"]},
+    {"rid": "linux-x64", "variant": "cpu", "upstream": "linux-x64-cpu.tar.gz", "format": "tar.gz",
+     "backends": ["cpu"], "entryLibrary": "libGgmlOps.so", "preload": [], "other": [],
+     "notices": [_TS, _GGML]},
+    {"rid": "linux-x64", "variant": "cuda12", "upstream": "linux-x64-cuda.tar.gz", "format": "tar.gz",
+     "backends": ["cpu", "cuda"], "entryLibrary": "libGgmlOps.so",
+     "preload": ["libcudart.so.12", "libcublasLt.so.12", "libcublas.so.12"], "other": [],
+     "notices": [_TS, _GGML, *_NVIDIA]},
+    {"rid": "linux-arm64", "variant": "cuda13-gb10", "upstream": "linux-arm64-cuda13-GB10.tar.gz", "format": "tar.gz",
+     "backends": ["cpu", "cuda"], "entryLibrary": "libGgmlOps.so",
+     "preload": ["libcudart.so.13", "libcublasLt.so.13", "libcublas.so.13"], "other": [],
+     "notices": [_TS, _GGML, *_NVIDIA], "note": GB10_NOTE},
+    {"rid": "win-x64", "variant": "cpu", "upstream": "win-x64-cpu.zip", "format": "zip",
+     "backends": ["cpu"], "entryLibrary": "GgmlOps.dll", "preload": [], "other": [],
+     "notices": [_TS, _GGML]},
+    {"rid": "win-x64", "variant": "cuda12", "upstream": "win-x64-cuda.zip", "format": "zip",
+     "backends": ["cpu", "cuda"], "entryLibrary": "GgmlOps.dll",
+     "preload": ["cudart64_12.dll", "cublasLt64_12.dll", "cublas64_12.dll"], "other": [],
+     "notices": [_TS, _GGML, *_NVIDIA]},
+)
+
+# The upstream archives that upstream publishes a SHA256SUMS file for, with that file's suffix:
+# tensorsharp-<version>-<suffix>.
+UPSTREAM_SUMS = {"linux-arm64-cuda13-GB10.tar.gz": "linux-arm64-cuda13-GB10-SHA256SUMS"}
+
+
+def upstream_archive_name(version: str, suffix: str) -> str:
+    return f"tensorsharp-cli-{version}-{suffix}"
+
+
+def row_files(row: dict) -> list[str]:
+    return [row["entryLibrary"], *row["preload"], *row["other"]]
+
+
+def check_sums(archive: Path, sums: Path) -> list[str]:
+    """Return why archive's SHA-256 is not the one sums lists for its name, or nothing."""
+    try:
+        lines = sums.read_text(encoding="utf-8").splitlines()
+    except OSError as error:
+        return [f"cannot read {sums}: {error}"]
+    listed = [line.split()[0] for line in lines if len(line.split()) == 2 and line.split()[1] == archive.name]
+    if len(listed) != 1:
+        return [f"{sums.name} lists {archive.name} {len(listed)} times, not once"]
+    digest = sha256_file(archive)
+    if digest != listed[0]:
+        return [f"{archive.name}: sha256 is {digest}, {sums.name} says {listed[0]}"]
+    return []
+
+
+def take_upstream_files(archive: Path, names: set[str], staging: Path) -> list[str]:
+    """Copy each named regular file at the archive's root to staging/<name>. Return the problems."""
+    problems: list[str] = []
+    found: set[str] = set()
+
+    def take(raw: str, regular: bool, source) -> None:
+        name = raw[2:] if raw.startswith("./") else raw
+        if name not in names:
+            return
+        if name in found:
+            problems.append(f"{archive.name}: {name} appears more than once")
+        elif not regular:
+            problems.append(f"{archive.name}: {name} is not a regular file")
+        else:
+            with (staging / name).open("wb") as handle:
+                shutil.copyfileobj(source(), handle, CHUNK)
+        found.add(name)
+
+    try:
+        if archive.name.endswith(".tar.gz"):
+            with tarfile.open(archive, "r|gz") as upstream:
+                for member in upstream:
+                    take(member.name, member.isfile(), lambda: upstream.extractfile(member))
+        else:
+            with zipfile.ZipFile(archive) as upstream:
+                for info in upstream.infolist():
+                    regular = not info.is_dir() and not stat.S_ISLNK(info.external_attr >> 16)
+                    take(info.filename, regular, lambda: upstream.open(info))
+    except (tarfile.TarError, zipfile.BadZipFile, OSError, EOFError) as error:
+        return [f"{archive.name} cannot be read: {error}"]
+    problems += [f"{archive.name} has no {name} at its root" for name in sorted(names - found)]
+    return problems
+
+
+def write_driver_archive(path: Path, fmt: str, entries: list[tuple[str, Path]]) -> None:
+    """Write entries (archive path, source file) in order. Equal input gives equal bytes."""
+    if fmt == "tar.gz":
+        with path.open("wb") as raw, gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0) as compressed, \
+                tarfile.open(fileobj=compressed, mode="w", format=tarfile.PAX_FORMAT) as archive:
+            for name, source in entries:
+                info = tarfile.TarInfo(name)
+                info.size, info.mode = source.stat().st_size, 0o644
+                with source.open("rb") as handle:
+                    archive.addfile(info, handle)
+        return
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
+        for name, source in entries:
+            info = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
+            info.compress_type, info.external_attr = zipfile.ZIP_DEFLATED, 0o644 << 16
+            info.file_size = source.stat().st_size
+            with source.open("rb") as handle, archive.open(info, "w") as target:
+                shutil.copyfileobj(handle, target, CHUNK)
+
+
+def measured(path: str, source: Path) -> dict:
+    return {"path": path, "size": source.stat().st_size, "sha256": sha256_file(source)}
+
+
+def extract_upstream(version: str, archives: Path, commit: str, out: Path) -> dict:
+    """Write one driver archive per UPSTREAM_VARIANTS row and the artifact manifest that generate reads."""
+    problems: list[str] = []
+    if not VERSION.match(version):
+        problems.append(f"version {version!r} must look like 2026.10.11")
+    if not COMMIT.match(commit):
+        problems.append(f"commit {commit!r} must be a full lowercase git commit id")
+    if out.exists() and (not out.is_dir() or any(out.iterdir())):
+        problems.append(f"{out} already exists and is not empty; remove it or choose another --out")
+    missing = sorted({n for row in UPSTREAM_VARIANTS for n in row["notices"] if not (NOTICES_DIR / n).is_file()})
+    problems += [f"notice {NOTICES_DIR / n} is missing" for n in missing]
+    if problems:
+        raise Refused(*problems)
+
+    out.mkdir(parents=True, exist_ok=True)
+    staging = out / "staging"
+    try:
+        for suffix in dict.fromkeys(row["upstream"] for row in UPSTREAM_VARIANTS):
+            archive = archives / upstream_archive_name(version, suffix)
+            if not archive.is_file() or archive.is_symlink():
+                problems.append(f"{archive} is missing or is not a regular file")
+                continue
+            if suffix in UPSTREAM_SUMS:
+                problems += check_sums(archive, archives / f"tensorsharp-{version}-{UPSTREAM_SUMS[suffix]}")
+            names = {n for row in UPSTREAM_VARIANTS if row["upstream"] == suffix for n in row_files(row)}
+            (staging / suffix).mkdir(parents=True)
+            problems += take_upstream_files(archive, names, staging / suffix)
+        if problems:
+            raise Refused(*problems)
+
+        artifacts = []
+        for row in UPSTREAM_VARIANTS:
+            files = [(name, staging / row["upstream"] / name) for name in row_files(row)]
+            listed = [(f"{NOTICE_DIR_IN_ARCHIVE}/{name}", NOTICES_DIR / name) for name in row["notices"]]
+            name = archive_name(version, row["rid"], row["variant"], row["format"])
+            write_driver_archive(out / name, row["format"], files + listed)
+            artifacts.append({
+                "rid": row["rid"], "variant": row["variant"], "delivery": HOSTED_DELIVERY,
+                "backends": list(row["backends"]), "entryLibrary": row["entryLibrary"],
+                "preload": list(row["preload"]), **({"note": row["note"]} if "note" in row else {}),
+                "files": [measured(path, source) for path, source in files],
+                "notices": [measured(path, source) for path, source in listed],
+                "archive": {"name": name, "format": row["format"], "size": (out / name).stat().st_size,
+                            "sha256": sha256_file(out / name)},
+                "tensorSharp": {"packageVersion": version, "packageCommit": commit, "nativeSourceCommit": commit},
+            })
+        manifest = {"schema": OUTPUT_SCHEMA, "artifacts": artifacts}
+        (out / OUTPUT_MANIFEST).write_bytes(dumps(manifest))
+    except BaseException:
+        shutil.rmtree(out, ignore_errors=True)
+        raise
+    shutil.rmtree(staging)
+    return manifest
+
+
 # Command line.
 
 def main(argv: list[str] | None = None) -> int:
@@ -860,6 +1054,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--gh", default="gh", help="gh command line, split like a shell would (default: gh)")
     parser.add_argument("--repository", default=REPOSITORY, help=argparse.SUPPRESS)
     commands = parser.add_subparsers(dest="command", required=True)
+
+    cmd = commands.add_parser("extract-upstream", help="write the driver archives and manifest from upstream's archives")
+    cmd.add_argument("--version", required=True, help="upstream TensorSharp version, such as 2026.10.11")
+    cmd.add_argument("--archives", type=Path, required=True, help="folder holding upstream's tensorsharp-cli archives")
+    cmd.add_argument("--commit", required=True, help="full commit id of upstream's release tag")
+    cmd.add_argument("--out", type=Path, help="output directory (default: tmp/upstream/<version>)")
 
     cmd = commands.add_parser("validate", help="check an artifact manifest against its local archives")
     cmd.add_argument("manifest", type=Path)
@@ -885,7 +1085,12 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     gh = shlex.split(args.gh)
     try:
-        if args.command == "validate":
+        if args.command == "extract-upstream":
+            out = args.out or ROOT / "tmp" / "upstream" / args.version
+            manifest = extract_upstream(args.version, args.archives, args.commit, out)
+            print(f"wrote {len(manifest['artifacts'])} driver archives and {OUTPUT_MANIFEST} to {out}")
+            print(f"next: generate {out / OUTPUT_MANIFEST} {out}")
+        elif args.command == "validate":
             catalog = validate(args.manifest, args.archive_dir)
             print(f"{COMPONENT} {catalog['version']}: {len(catalog['artifacts'])} archives are valid")
         elif args.command == "generate":

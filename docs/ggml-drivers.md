@@ -2,12 +2,15 @@
 
 Optional GGML driver archives are published as GitHub release assets in
 `DarkspyreStudios/darkspyre-releases`. Each archive holds the native files for one runtime
-identifier (RID) and one variant, such as `linux-x64` with `cuda13`. `tools/ggml_drivers.py`
-validates a release, writes the files to upload, checks GitHub for collisions and verifies a
-published release. `docs/ggml-drivers-publish-checklist.md` lists the steps of a publication.
+identifier (RID) and one variant, such as `linux-x64` with `cuda12`. The driver files are upstream
+TensorSharp's own builds, taken unchanged from upstream's release archives. `tools/ggml_drivers.py`
+extracts them, validates a release, writes the files to upload, checks GitHub for collisions and
+verifies a published release. `docs/ggml-drivers-publish-checklist.md` lists the steps of a
+publication.
 
-The tool never creates a tag or a release and never uploads an asset. The owner runs the
-`gh release` commands in the checklist.
+The tool never creates a tag or a release and never uploads an asset. Publishing a driver release is
+an ops task: the agent that prepares the release runs the `gh release` commands in the checklist,
+with no per-version approval.
 
 ## Trust
 
@@ -25,7 +28,7 @@ already exists. A corrected build gets a new TensorSharp version.
 | --- | --- | --- |
 | Tag | `ggml-drivers-v<version>` | `ggml-drivers-v2.9.0` |
 | Release title | `GGML drivers <version>` | `GGML drivers 2.9.0` |
-| Archive asset | `ggml-<version>-<rid>-<variant>.<format>` | `ggml-2.9.0-linux-x64-cuda13.tar.gz` |
+| Archive asset | `ggml-<version>-<rid>-<variant>.<format>` | `ggml-2.9.0-linux-x64-cuda12.tar.gz` |
 | Release manifest asset | `release.json` | `release.json` |
 | Download URL | `https://github.com/DarkspyreStudios/darkspyre-releases/releases/download/<tag>/<asset>` | |
 
@@ -40,12 +43,47 @@ asset name. Asset names use only letters, digits, `.`, `-` and `_`, so GitHub st
 Every GGML driver release is created with `--latest=false`. The repository holds several
 components, and GitHub's "latest" marker must not point at a driver release.
 
+## Extraction from upstream TensorSharp
+
+`extract-upstream` builds the driver archives from upstream TensorSharp's CLI release archives,
+`tensorsharp-cli-<version>-<suffix>` in zhongkaifu/TensorSharp's release `v<version>`. Each driver
+file sits at the root of its upstream archive. A constant in the tool lists the variants:
+
+| RID | Variant | Upstream archive suffix | Backends | Entry library | Preload, in order | Other files | Notices |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `osx-arm64` | `metal` | `osx-arm64.tar.gz` | cpu, metal | `libGgmlOps.dylib` | | | TensorSharp, ggml |
+| `osx-arm64` | `mlx` | `osx-arm64.tar.gz` | mlx | `libmlxc.dylib` | | `libmlx.dylib`, `mlx.metallib` | TensorSharp, MLX, mlx-c |
+| `linux-x64` | `cpu` | `linux-x64-cpu.tar.gz` | cpu | `libGgmlOps.so` | | | TensorSharp, ggml |
+| `linux-x64` | `cuda12` | `linux-x64-cuda.tar.gz` | cpu, cuda | `libGgmlOps.so` | `libcudart.so.12`, `libcublasLt.so.12`, `libcublas.so.12` | | TensorSharp, ggml, NVIDIA cudart, NVIDIA cuBLAS |
+| `linux-arm64` | `cuda13-gb10` | `linux-arm64-cuda13-GB10.tar.gz` | cpu, cuda | `libGgmlOps.so` | `libcudart.so.13`, `libcublasLt.so.13`, `libcublas.so.13` | | TensorSharp, ggml, NVIDIA cudart, NVIDIA cuBLAS |
+| `win-x64` | `cpu` | `win-x64-cpu.zip` | cpu | `GgmlOps.dll` | | | TensorSharp, ggml |
+| `win-x64` | `cuda12` | `win-x64-cuda.zip` | cpu, cuda | `GgmlOps.dll` | `cudart64_12.dll`, `cublasLt64_12.dll`, `cublas64_12.dll` | | TensorSharp, ggml, NVIDIA cudart, NVIDIA cuBLAS |
+
+The `cuda13-gb10` row carries the note "Built for NVIDIA GB10 (Grace Blackwell) GPUs only.",
+because upstream builds its CUDA code for that GPU alone. No other row has a note.
+`libjaccl.dylib`, MLX's distributed backend, is not extracted, because no driver file links it.
+
+Each driver archive holds the row's files at its root, in the table's order, then each notice under
+`licenses/`. The notices come from `tools/notices/`, whose `README.md` names each file's source.
+Entries carry mode 0644 and no timestamp, so equal input gives equal archives.
+
+`extract-upstream` refuses, and leaves no output, when:
+
+- an upstream archive is missing, or has no listed file at its root, or holds one as anything other
+  than a regular file;
+- the GB10 archive's SHA-256 differs from the line for it in
+  `tensorsharp-<version>-linux-arm64-cuda13-GB10-SHA256SUMS` in the same folder, or that file is
+  missing or lists the archive other than once. Upstream publishes sums for that archive only.
+
+It writes the driver archives and `tensorsharp-native-artifacts.json`, the artifact manifest
+`generate` reads, to the output folder. Each artifact records the upstream tag commit as both
+`tensorSharp.packageCommit` and `tensorSharp.nativeSourceCommit`.
+
 ## Input: the TensorSharp native artifact manifest
 
-One JSON file from the TensorSharp release is the single input for archive names, sizes, hashes and
-contents. It has the `tensorsharp-native-artifacts` shape that TensorSharp's
-`eng/native-artifact-manifest.py` produces. The tool reads the fields below and ignores every other
-field, such as `packages`, `binaryIdentity`, `build` and `requires`.
+One JSON file is the single input for archive names, sizes, hashes and contents. It has the
+`tensorsharp-native-artifacts` shape, and `extract-upstream` writes it. The tool reads the fields
+below and ignores every other field.
 
 An artifact is hosted when it has `delivery` `variant-archive` or a non-null `archive`. Every other
 artifact ships in a baseline package and is skipped. At least one artifact must be hosted.
@@ -54,14 +92,15 @@ artifact ships in a baseline package and is skipped. At least one artifact must 
 | --- | --- |
 | `schema` | `tensorsharp-native-artifacts/draft-1` or `tensorsharp-native-artifacts/1`. |
 | `artifacts[].rid` | One of `osx-arm64`, `osx-x64`, `linux-x64`, `linux-arm64`, `win-x64`, `win-arm64`. |
-| `artifacts[].variant` | Lowercase letters and digits with inner hyphens, such as `cpu`, `vulkan`, `cuda13`. Each RID and variant pair is hosted once. |
+| `artifacts[].variant` | Lowercase letters and digits with inner hyphens, such as `cpu`, `cuda12`, `cuda13-gb10`. Each RID and variant pair is hosted once. |
 | `artifacts[].delivery` | Absent or `variant-archive` on a hosted artifact. |
 | `artifacts[].tensorSharp.packageVersion` | The release version: two to four numeric components with an optional prerelease suffix. Equal on every hosted artifact. |
 | `artifacts[].tensorSharp.packageCommit` | The full lowercase TensorSharp commit id of the release. Equal on every hosted artifact. |
 | `artifacts[].tensorSharp.nativeSourceCommit` | The full lowercase commit id the natives were built from. Equal on every hosted artifact. |
-| `artifacts[].ggml.version`, `.commit` | The ggml version and full lowercase commit id. Equal on every hosted artifact. |
 | `artifacts[].backends` | A non-empty list of distinct lowercase backend names, such as `["cpu", "cuda"]`. |
 | `artifacts[].entryLibrary` | The path of the library the engine loads. It must be a regular file listed in `files`. |
+| `artifacts[].preload` | Optional, default empty. The libraries the engine loads by absolute path, in order, before the entry library. Each must be a top-level regular file listed in `files`, other than `entryLibrary`, and appear once. |
+| `artifacts[].note` | Optional. One line of at most 200 characters that the app shows on the variant's row, such as a hardware limit. |
 | `artifacts[].files` | Every native file in the archive: `{path, size, sha256}` for a regular file, or `{path, link}` for a tar symbolic link. |
 | `artifacts[].notices` | Every license and notice file in the archive: a path, or `{path, size, sha256}`. At least one is required. |
 | `artifacts[].totalSize` | Optional. When present, the sum of the `files` sizes. |
@@ -134,26 +173,32 @@ so equal input gives equal bytes.
     "commit": "<40 hex digits>",
     "nativeSourceCommit": "<40 hex digits>"
   },
-  "ggml": {"version": "0.25.3", "commit": "<40 hex digits>"},
   "source": {"schema": "tensorsharp-native-artifacts/1", "sha256": "<sha256 of the artifact manifest>"},
   "artifacts": [
     {
       "rid": "linux-x64",
-      "variant": "cuda13",
+      "variant": "cuda12",
       "backends": ["cpu", "cuda"],
       "entryLibrary": "libGgmlOps.so",
+      "preload": ["libcudart.so.12", "libcublasLt.so.12", "libcublas.so.12"],
       "asset": {
-        "name": "ggml-2.9.0-linux-x64-cuda13.tar.gz",
+        "name": "ggml-2.9.0-linux-x64-cuda12.tar.gz",
         "format": "tar.gz",
         "size": 734003,
         "sha256": "<64 hex digits>",
-        "url": "https://github.com/DarkspyreStudios/darkspyre-releases/releases/download/ggml-drivers-v2.9.0/ggml-2.9.0-linux-x64-cuda13.tar.gz"
+        "url": "https://github.com/DarkspyreStudios/darkspyre-releases/releases/download/ggml-drivers-v2.9.0/ggml-2.9.0-linux-x64-cuda12.tar.gz"
       },
       "files": [
-        {"path": "libGgmlOps.so", "size": 726234384, "sha256": "<64 hex digits>"}
+        {"path": "libGgmlOps.so", "size": 630929664, "sha256": "<64 hex digits>"},
+        {"path": "libcublas.so.12", "size": 108244960, "sha256": "<64 hex digits>"},
+        {"path": "libcublasLt.so.12", "size": 491106832, "sha256": "<64 hex digits>"},
+        {"path": "libcudart.so.12", "size": 716128, "sha256": "<64 hex digits>"}
       ],
       "notices": [
-        {"path": "THIRD-PARTY-NOTICES.txt", "size": 22, "sha256": "<64 hex digits>"}
+        {"path": "licenses/NVIDIA-cuBLAS.txt", "size": 67875, "sha256": "<64 hex digits>"},
+        {"path": "licenses/NVIDIA-cudart.txt", "size": 67875, "sha256": "<64 hex digits>"},
+        {"path": "licenses/TensorSharp-LICENSE.txt", "size": 1498, "sha256": "<64 hex digits>"},
+        {"path": "licenses/ggml-LICENSE.txt", "size": 1078, "sha256": "<64 hex digits>"}
       ]
     }
   ]
@@ -162,7 +207,8 @@ so equal input gives equal bytes.
 
 Every notice carries the size and SHA-256 measured from the validated archive, whether or not the
 artifact manifest listed them. `files` entries carry the manifest's values, which the archive check
-confirmed. A symbolic link appears as `{path, link}`.
+confirmed. A symbolic link appears as `{path, link}`. `preload` is always present, possibly empty.
+An artifact with a note carries it as `note` after `preload`; the catalog has no `ggml` block.
 
 ### release.json
 
@@ -180,11 +226,11 @@ confirmed. A symbolic link appears as `{path, link}`.
   "assets": [
     {
       "rid": "linux-x64",
-      "variant": "cuda13",
-      "name": "ggml-2.9.0-linux-x64-cuda13.tar.gz",
+      "variant": "cuda12",
+      "name": "ggml-2.9.0-linux-x64-cuda12.tar.gz",
       "format": "tar.gz",
       "size": 734003,
-      "url": "https://github.com/DarkspyreStudios/darkspyre-releases/releases/download/ggml-drivers-v2.9.0/ggml-2.9.0-linux-x64-cuda13.tar.gz"
+      "url": "https://github.com/DarkspyreStudios/darkspyre-releases/releases/download/ggml-drivers-v2.9.0/ggml-2.9.0-linux-x64-cuda12.tar.gz"
     }
   ]
 }
@@ -239,6 +285,11 @@ Run from the repository root. Each command exits 0 on success, 1 on a refused re
 usage error.
 
 ```bash
+# Write the driver archives and tmp/upstream/<version>/tensorsharp-native-artifacts.json from
+# upstream's CLI archives and the GB10 SHA256SUMS file, downloaded into <upstream-dir>.
+python3 tools/ggml_drivers.py extract-upstream --version <version> --archives <upstream-dir> \
+  --commit <upstream tag commit> [--out <dir>]
+
 # Check the artifact manifest and its archives.
 python3 tools/ggml_drivers.py validate <artifacts.json> <archive-dir>
 
@@ -263,8 +314,8 @@ python3 tools/ggml_drivers.py verify-published tmp/releases/ggml-drivers-v<versi
 python3 -m unittest discover -s tests -v
 ```
 
-The tests build fixture archives and an artifact manifest in the DSA-98 draft shape under
-`tmp/tests/`, and remove them afterwards. `tests/stub_gh.py` answers the `gh api` listings from a
+The tests build fixture archives, an artifact manifest in the DSA-98 draft shape and synthetic
+upstream CLI archives under `tmp/tests/`, and remove them afterwards. `tests/stub_gh.py` answers the `gh api` listings from a
 JSON state file and exits with an error for any other command. `tests/github_server.py` serves
 assets on 127.0.0.1 through a `302` redirect to single-use signed URLs, with range, `If-Range` and
 dropped-connection behaviour. No test reaches the public network.
