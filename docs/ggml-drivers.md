@@ -85,12 +85,11 @@ One JSON file is the single input for archive names, sizes, hashes and contents.
 `tensorsharp-native-artifacts` shape, and `extract-upstream` writes it. The tool reads the fields
 below and ignores every other field.
 
-An artifact is hosted when it has `delivery` `variant-archive` or a non-null `archive`. Every other
-artifact ships in a baseline package and is skipped. At least one artifact must be hosted.
+Every artifact must have an archive. At least one artifact is required.
 
 | Field | Rule |
 | --- | --- |
-| `schema` | `tensorsharp-native-artifacts/draft-1` or `tensorsharp-native-artifacts/1`. |
+| `schema` | `tensorsharp-native-artifacts/1`. |
 | `artifacts[].rid` | One of `osx-arm64`, `osx-x64`, `linux-x64`, `linux-arm64`, `win-x64`, `win-arm64`. |
 | `artifacts[].variant` | Lowercase letters and digits with inner hyphens, such as `cpu`, `cuda12`, `cuda13-gb10`. Each RID and variant pair is hosted once. |
 | `artifacts[].delivery` | Absent or `variant-archive` on a hosted artifact. |
@@ -101,7 +100,7 @@ artifact ships in a baseline package and is skipped. At least one artifact must 
 | `artifacts[].entryLibrary` | The path of the library the engine loads. It must be a regular file listed in `files`. |
 | `artifacts[].preload` | Optional, default empty. The libraries the engine loads by absolute path, in order, before the entry library. Each must be a top-level regular file listed in `files`, other than `entryLibrary`, and appear once. |
 | `artifacts[].note` | Optional. One line of at most 200 characters that the app shows on the variant's row, such as a hardware limit. |
-| `artifacts[].files` | Every native file in the archive: `{path, size, sha256}` for a regular file, or `{path, link}` for a tar symbolic link. |
+| `artifacts[].files` | Every native file in the archive: `{path, size, sha256}` for a regular file. |
 | `artifacts[].notices` | Every license and notice file in the archive: a path, or `{path, size, sha256}`. At least one is required. |
 | `artifacts[].totalSize` | Optional. When present, the sum of the `files` sizes. |
 | `artifacts[].archive` | `{name, format, size, sha256}`. `format` is `tar.gz` or `zip`. `name` follows the release layout. |
@@ -109,8 +108,7 @@ artifact ships in a baseline package and is skipped. At least one artifact must 
 Paths are relative POSIX paths. A path must not be absolute or hold a backslash, a control
 character, an empty, `.` or `..` segment, a character Windows cannot store (`<>:"|?*`), a segment
 ending in a dot or space, or a reserved Windows device name such as `con` or `nul`. Paths are unique
-case-insensitively. A notice that names the same path, size and SHA-256 as a `files` entry is that
-file, listed once as a notice; TensorSharp lists every licence file both ways. Any other path in both lists is refused.
+case-insensitively. A path in both `files` and `notices` is refused.
 
 The archives sit in one directory, under their `archive.name` values.
 
@@ -122,14 +120,12 @@ The tool opens every hosted archive and refuses it when:
 - a listed file or notice is missing;
 - a regular file's length or SHA-256 differs from its `files` entry, or from its `notices` entry
   when that entry carries them;
-- it holds a file or link that neither `files` nor `notices` lists;
+- it holds a file that neither `files` nor `notices` lists;
 - it holds a directory that contains no listed file;
 - an entry name breaks the path rules above, or appears twice;
 - two entry names differ only by letter case;
-- an entry is a hard link, a device or a FIFO;
-- a zip entry is a symbolic link or is encrypted;
-- a tar symbolic link is not listed with `link`, has a different target, has an absolute target,
-  resolves outside the archive, or does not resolve to a regular file entry;
+- an entry is a symbolic link, a hard link, a device or a FIFO;
+- a zip entry is encrypted;
 - a listed path passes through an entry that is not a directory.
 
 A leading `./` on tar entry names is accepted and removed. `files` and `notices` together describe
@@ -207,7 +203,7 @@ so equal input gives equal bytes.
 
 Every notice carries the size and SHA-256 measured from the validated archive, whether or not the
 artifact manifest listed them. `files` entries carry the manifest's values, which the archive check
-confirmed. A symbolic link appears as `{path, link}`. `preload` is always present, possibly empty.
+confirmed. `preload` is always present, possibly empty.
 An artifact with a note carries it as `note` after `preload`; the catalog has no `ggml` block.
 
 ### release.json

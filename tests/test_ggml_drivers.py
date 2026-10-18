@@ -84,19 +84,18 @@ def file_entry(path: str, data: bytes) -> dict:
 
 
 class Fixture:
-    """A directory holding fixture archives and a TensorSharp artifact manifest in the DSA-98 draft shape."""
+    """A directory holding fixture archives and a TensorSharp artifact manifest."""
 
     def __init__(self, directory: Path, version: str = VERSION):
         self.dir = directory
         self.dir.mkdir(parents=True)
         self.version = version
-        self.data: dict = {"schema": "tensorsharp-native-artifacts/draft-1", "packages": [], "artifacts": []}
+        self.data: dict = {"schema": "tensorsharp-native-artifacts/1", "artifacts": []}
 
         so = blob("linux-cpu", 300_000)
         self.add("linux-x64", "cpu", "tar.gz", ["cpu"], "libGgmlOps.so",
                  files={"lib/libGgmlOps.so.1": so, "THIRD-PARTY-NOTICES.txt": NOTICE},
-                 file_list=[{"path": "lib/libGgmlOps.so", "link": "libGgmlOps.so.1"}, file_entry("lib/libGgmlOps.so.1", so)],
-                 notices=["THIRD-PARTY-NOTICES.txt"], links={"lib/libGgmlOps.so": "libGgmlOps.so.1"}, dirs=["lib"],
+                 notices=["THIRD-PARTY-NOTICES.txt"], dirs=["lib"],
                  entry_path="lib/libGgmlOps.so.1")
         cuda, cudart = blob("cuda", 500_000), blob("cudart", 200_000)
         self.add("linux-x64", "cuda13", "tar.gz", ["cpu", "cuda"], "libGgmlOps.so",
@@ -107,24 +106,18 @@ class Fixture:
         self.add("win-x64", "cpu", "zip", ["cpu"], "GgmlOps.dll",
                  files={"GgmlOps.dll": dll, "vcruntime140.dll": vc, "THIRD-PARTY-NOTICES.txt": NOTICE},
                  notices=["THIRD-PARTY-NOTICES.txt"])
-        # A baseline artifact delivered in a package: no archive, so it is not hosted.
-        self.data["artifacts"].append({
-            "rid": "osx-arm64", "variant": "metal", "backends": ["cpu", "metal"],
-            "delivery": "baseline-package", "archive": None, "notices": [],
-            "files": [file_entry("libGgmlOps.dylib", b"dylib")], "entryLibrary": "libGgmlOps.dylib",
-        })
         self.write()
 
-    def add(self, rid, variant, fmt, backends, entry, files, notices, file_list=None, links=None, dirs=None,
+    def add(self, rid, variant, fmt, backends, entry, files, notices, dirs=None,
             entry_path=None) -> None:
         name = f"ggml-{self.version}-{rid}-{variant}.{fmt}"
         path = self.dir / name
         notice_paths = {n if isinstance(n, str) else n["path"] for n in notices}
         if fmt == "tar.gz":
-            write_tar(path, files, links=links, dirs=dirs)
+            write_tar(path, files, dirs=dirs)
         else:
             write_zip(path, files)
-        payload = file_list or [file_entry(p, d) for p, d in files.items() if p not in notice_paths]
+        payload = [file_entry(p, d) for p, d in files.items() if p not in notice_paths]
         artifact = {
             "rid": rid, "variant": variant, "backends": backends, "delivery": "variant-archive",
             "tensorSharp": {"packageVersion": self.version, "packageCommit": PACKAGE_COMMIT,
@@ -211,17 +204,6 @@ class GenerateTests(ToolTestCase):
         self.assertNotIn("sha256", json.dumps(release["assets"]))
         self.assertEqual(release["source"]["sha256"], catalog["source"]["sha256"])
 
-    def test_licence_listed_as_file_and_notice_is_one_notice(self) -> None:
-        cuda = next(a for a in self.fixture.data["artifacts"] if "licenses/cuda.txt" in a["notices"])
-        licence = file_entry("licenses/cuda.txt", b"CUDA EULA\n")
-        cuda["notices"] = [licence if n == "licenses/cuda.txt" else n for n in cuda["notices"]]
-        cuda["files"].append(dict(licence))
-        cuda["totalSize"] = sum(f.get("size", 0) for f in cuda["files"])
-        self.fixture.write()
-        catalog = self.generate()
-        listed = next(a for a in catalog["artifacts"] if any(n["path"] == "licenses/cuda.txt" for n in a["notices"]))
-        self.assertNotIn("licenses/cuda.txt", [f["path"] for f in listed["files"]])
-
     def test_catalog_carries_measured_notices_and_identity(self) -> None:
         catalog = self.generate()
         cuda = catalog["artifacts"][1]
@@ -232,7 +214,6 @@ class GenerateTests(ToolTestCase):
                                                   "nativeSourceCommit": NATIVE_COMMIT})
         self.assertNotIn("ggml", catalog)
         self.assertEqual(catalog["source"]["sha256"], sha(self.fixture.path.read_bytes()))
-        self.assertIn({"path": "lib/libGgmlOps.so", "link": "libGgmlOps.so.1"}, catalog["artifacts"][0]["files"])
 
     def test_output_is_deterministic(self) -> None:
         self.generate()
@@ -311,10 +292,10 @@ class InputTests(ToolTestCase):
         self.mutate(lambda d: d["artifacts"][2].update(archive=None), "no archive object")
 
     def test_archive_with_other_delivery(self) -> None:
-        self.mutate(lambda d: d["artifacts"][2].update(delivery="baseline-package"), "delivery must be")
+        self.mutate(lambda d: d["artifacts"][2].update(delivery="other"), "delivery must be")
 
     def test_nothing_hosted(self) -> None:
-        self.mutate(lambda d: d.update(artifacts=d["artifacts"][3:]), "nothing to host")
+        self.mutate(lambda d: d.update(artifacts=[]), "nothing to host")
 
     def test_entry_library_must_be_a_payload_file(self) -> None:
         self.mutate(lambda d: d["artifacts"][0].update(entryLibrary="lib/libGgmlOps.so"), "entryLibrary")
@@ -410,12 +391,14 @@ class ArchiveTests(ToolTestCase):
                                                            "THIRD-PARTY-NOTICES.txt": NOTICE, "../evil.dll": b"x"})
         self.refused(self.validate, "entry '../evil.dll'")
 
-    def test_hard_link(self) -> None:
-        self.fixture.rewrite("linux-x64", "cuda13", write_tar, {
-            "libGgmlOps.so": blob("cuda", 500_000), "libcudart.so.13": blob("cudart", 200_000),
-            "THIRD-PARTY-NOTICES.txt": NOTICE, "licenses/cuda.txt": b"CUDA EULA\n"},
-            hard_links={"copy.so": "libGgmlOps.so"})
-        self.refused(self.validate, "hard link or special file")
+    def test_tar_links(self) -> None:
+        for kind in ("links", "hard_links"):
+            with self.subTest(kind=kind):
+                self.fixture.rewrite("linux-x64", "cuda13", write_tar, {
+                    "libGgmlOps.so": blob("cuda", 500_000), "libcudart.so.13": blob("cudart", 200_000),
+                    "THIRD-PARTY-NOTICES.txt": NOTICE, "licenses/cuda.txt": b"CUDA EULA\n"},
+                    **{kind: {"copy.so": "libGgmlOps.so"}})
+                self.refused(self.validate, "symbolic link, hard link or special file")
 
     def test_zip_symlink(self) -> None:
         self.fixture.rewrite("win-x64", "cpu", write_zip, {"GgmlOps.dll": blob("win", 250_000),
@@ -423,26 +406,6 @@ class ArchiveTests(ToolTestCase):
                                                            "THIRD-PARTY-NOTICES.txt": NOTICE},
                              links={"link.dll": "GgmlOps.dll"})
         self.refused(self.validate, "zip archives must not hold links")
-
-    def test_escaping_symlink(self) -> None:
-        so = blob("linux-cpu", 300_000)
-        self.fixture.artifact("linux-x64", "cpu")["files"][0]["link"] = "../../etc/passwd"
-        self.fixture.rewrite("linux-x64", "cpu", write_tar, {"lib/libGgmlOps.so.1": so, "THIRD-PARTY-NOTICES.txt": NOTICE},
-                             links={"lib/libGgmlOps.so": "../../etc/passwd"}, dirs=["lib"])
-        self.refused(self.validate, "escapes the archive")
-
-    def test_symlink_target_must_match_manifest(self) -> None:
-        so = blob("linux-cpu", 300_000)
-        self.fixture.rewrite("linux-x64", "cpu", write_tar,
-                             {"lib/libGgmlOps.so.1": so, "lib/other.so": so, "THIRD-PARTY-NOTICES.txt": NOTICE},
-                             links={"lib/libGgmlOps.so": "other.so"}, dirs=["lib"])
-        self.refused(self.validate, "the manifest says 'libGgmlOps.so.1'")
-
-    def test_unlisted_symlink(self) -> None:
-        so = blob("linux-cpu", 300_000)
-        self.fixture.rewrite("linux-x64", "cpu", write_tar, {"lib/libGgmlOps.so.1": so, "THIRD-PARTY-NOTICES.txt": NOTICE},
-                             links={"lib/libGgmlOps.so": "libGgmlOps.so.1", "lib/x.so": "libGgmlOps.so.1"}, dirs=["lib"])
-        self.refused(self.validate, "symbolic link lib/x.so is not listed")
 
     def test_corrupt_archive(self) -> None:
         self.fixture.rewrite("linux-x64", "cuda13", lambda p: p.write_bytes(b"not a gzip stream"))

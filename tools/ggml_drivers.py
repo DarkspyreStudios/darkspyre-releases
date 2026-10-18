@@ -23,7 +23,6 @@ import hashlib
 import http.client
 import json
 import os
-import posixpath
 import re
 import shlex
 import shutil
@@ -49,7 +48,7 @@ ASSETS_DIR = "assets"
 NOTES_FILE = "notes.md"
 RELEASE_SCHEMA = "darkspyre.ggml-drivers.release/1"
 CATALOG_SCHEMA = "darkspyre.ggml-drivers.catalog/1"
-INPUT_SCHEMAS = frozenset({"tensorsharp-native-artifacts/draft-1", "tensorsharp-native-artifacts/1"})
+INPUT_SCHEMA = "tensorsharp-native-artifacts/1"
 HOSTED_DELIVERY = "variant-archive"
 
 RIDS = frozenset({"osx-arm64", "osx-x64", "linux-x64", "linux-arm64", "win-x64", "win-arm64"})
@@ -129,7 +128,7 @@ def relative_path_problem(value) -> str | None:
 # Input: the TensorSharp native artifact manifest.
 
 def check_file_list(label: str, value, problems: list[str], notices: bool) -> list[dict]:
-    """Normalize a files or notices list. A payload entry has size and sha256, or link. A notice may be a bare path."""
+    """Normalize a files or notices list. A payload entry has size and sha256. A notice may be a bare path."""
     if not isinstance(value, list) or not value:
         problems.append(f"{label} must be a non-empty list")
         return []
@@ -152,15 +151,7 @@ def check_file_list(label: str, value, problems: list[str], notices: bool) -> li
             continue
         seen.add(path.casefold())
         entry: dict = {"path": path}
-        if "link" in item and not notices:
-            if not isinstance(item["link"], str) or not item["link"]:
-                problems.append(f"{where} link must be a non-empty string")
-                continue
-            if "size" in item or "sha256" in item:
-                problems.append(f"{where} is a link and must not carry size or sha256")
-                continue
-            entry["link"] = item["link"]
-        elif "size" in item or "sha256" in item or not notices:
+        if "size" in item or "sha256" in item or not notices:
             size, digest = item.get("size"), item.get("sha256")
             if not is_int(size) or size < 0:
                 problems.append(f"{where} size {size!r} must be a non-negative integer")
@@ -173,22 +164,14 @@ def check_file_list(label: str, value, problems: list[str], notices: bool) -> li
     return clean
 
 
-def is_hosted(artifact: dict) -> bool:
-    return artifact.get("archive") is not None or artifact.get("delivery") == HOSTED_DELIVERY
-
-
 def parse_input(data) -> dict:
-    """Validate a TensorSharp artifact manifest and return the hosted release it describes.
-
-    Artifacts with a null archive and no variant-archive delivery are delivered in baseline packages
-    and are skipped. Unknown fields are ignored.
-    """
+    """Validate a TensorSharp artifact manifest and return its release. Unknown fields are ignored."""
     if not isinstance(data, dict):
         raise Refused("the artifact manifest must be a JSON object")
     problems: list[str] = []
     schema = data.get("schema")
-    if schema not in INPUT_SCHEMAS:
-        problems.append(f"schema {schema!r} must be one of {', '.join(sorted(INPUT_SCHEMAS))}")
+    if schema != INPUT_SCHEMA:
+        problems.append(f"schema {schema!r} must be {INPUT_SCHEMA}")
     artifacts = data.get("artifacts")
     if not isinstance(artifacts, list):
         raise Refused(*problems, "artifacts must be a list")
@@ -200,8 +183,6 @@ def parse_input(data) -> dict:
         label = f"artifacts[{index}]"
         if not isinstance(artifact, dict):
             problems.append(f"{label} must be an object")
-            continue
-        if not is_hosted(artifact):
             continue
         rid, variant = artifact.get("rid"), artifact.get("variant")
         label = f"{label} ({rid}/{variant})"
@@ -243,15 +224,11 @@ def parse_input(data) -> dict:
         total = artifact.get("totalSize")
         if total is not None and total != sum(f.get("size", 0) for f in files):
             problems.append(f"{label} totalSize {total!r} is not the sum of its file sizes")
-        # TensorSharp's pack-ggml-natives.py lists each licence file in files and again in notices. A notice that names
-        # the same size and SHA-256 as its file entry is one notice; any other overlap is refused.
-        same = {(n["path"].casefold(), n.get("size"), n.get("sha256")) for n in notices if "size" in n}
-        files = [f for f in files if (f["path"].casefold(), f.get("size"), f.get("sha256")) not in same]
         overlap = {f["path"].casefold() for f in files} & {n["path"].casefold() for n in notices}
         if overlap:
             problems.append(f"{label} lists {', '.join(sorted(overlap))} in both files and notices")
         entry = artifact.get("entryLibrary")
-        regular = {f["path"] for f in files if "link" not in f}
+        regular = {f["path"] for f in files}
         if entry not in regular:
             problems.append(f"{label} entryLibrary {entry!r} must be a regular file listed in files")
         preload = artifact.get("preload", [])
@@ -313,7 +290,7 @@ def hash_stream(handle) -> tuple[int, str]:
 
 
 def read_entries(path: Path, fmt: str) -> tuple[dict[str, dict], list[str]]:
-    """Return {name: {kind, target, size, sha256}} for every archive entry, and the entry-level problems."""
+    """Return {name: {kind, size, sha256}} for every archive entry, and the entry-level problems."""
     entries: dict[str, dict] = {}
     problems: list[str] = []
 
@@ -340,10 +317,8 @@ def read_entries(path: Path, fmt: str) -> tuple[dict[str, dict], list[str]]:
                     elif member.isfile():
                         size, digest = hash_stream(archive.extractfile(member))
                         add(member.name, "file", size=size, sha256=digest)
-                    elif member.issym():
-                        add(member.name, "link", target=member.linkname)
                     else:
-                        problems.append(f"entry {member.name!r} is a hard link or special file")
+                        problems.append(f"entry {member.name!r} is a symbolic link, hard link or special file")
         else:
             with zipfile.ZipFile(path) as archive:
                 for info in archive.infolist():
@@ -401,26 +376,9 @@ def check_archive(path: Path, artifact: dict) -> tuple[list[str], list[dict]]:
                 problems.append(f"{label}: directory {name} holds no listed file")
             continue
         if name not in listed:
-            problems.append(f"{label}: {'symbolic link' if kind == 'link' else 'file'} {name} is not listed in files or notices")
+            problems.append(f"{label}: file {name} is not listed in files or notices")
             continue
         role, expected = listed[name]
-        if kind == "link":
-            target = found["target"]
-            if "link" not in expected:
-                problems.append(f"{label}: {name} is a symbolic link, the manifest lists a regular {role} file")
-                continue
-            if target != expected["link"]:
-                problems.append(f"{label}: symbolic link {name} -> {target!r}, the manifest says {expected['link']!r}")
-            resolved = posixpath.normpath(posixpath.join(posixpath.dirname(name), target or ""))
-            if (not target or target.startswith("/") or "\\" in target
-                    or resolved == ".." or resolved.startswith("../")):
-                problems.append(f"{label}: symbolic link {name} -> {target!r} escapes the archive")
-            elif entries.get(resolved, {}).get("kind") != "file":
-                problems.append(f"{label}: symbolic link {name} -> {target!r} does not name a regular file entry")
-            continue
-        if "link" in expected:
-            problems.append(f"{label}: {name} is a regular file, the manifest lists a symbolic link")
-            continue
         if "size" in expected and (found["size"], found["sha256"]) != (expected["size"], expected["sha256"]):
             problems.append(f"{label}: {role} {name} is {found['size']} bytes with sha256 {found['sha256']}, "
                             f"the manifest says {expected['size']} bytes with sha256 {expected['sha256']}")
@@ -484,7 +442,7 @@ def build_catalog(release: dict, source_sha256: str, notices: dict[tuple, list[d
                 "sha256": archive["sha256"],
                 "url": asset_url(tag, archive["name"]),
             },
-            "files": sorted(({k: f[k] for k in ("path", "link", "size", "sha256") if k in f} for f in a["files"]),
+            "files": sorted(({k: f[k] for k in ("path", "size", "sha256") if k in f} for f in a["files"]),
                             key=lambda f: f["path"]),
             "notices": sorted(notices[(a["rid"], a["variant"])], key=lambda n: n["path"]),
         })
